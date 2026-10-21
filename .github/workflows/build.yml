@@ -153,18 +153,17 @@ jobs:
           
           mkdir -p dist
           PKG_FILE=$(ls aur-recipe/noctalia-git-*.pkg.tar.zst | head -n1)
-          cp "$PKG_FILE" dist/
           cp "$PKG_FILE" dist/noctalia-git-latest-x86_64_v3.pkg.tar.zst
           
           cd dist
-          sha256sum noctalia-git-*.pkg.tar.zst > sha256sums.txt
+          sha256sum noctalia-git-latest-x86_64_v3.pkg.tar.zst > sha256sums.txt
           cd ..
 
       - name: Extract package version metadata
         id: meta
         run: |
           set -euo pipefail
-          PKG_FILE=$(ls dist/noctalia-git-*.pkg.tar.zst | grep -v 'latest' | head -n1)
+          PKG_FILE=$(ls aur-recipe/noctalia-git-*.pkg.tar.zst | head -n1)
           VERSION=$(basename "$PKG_FILE" | sed -E 's/^noctalia-git-//;s/-(x86_64|x86_64_v3)\.pkg\.tar\.zst$//')
           REAL_FILENAME=$(basename "$PKG_FILE")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -181,7 +180,7 @@ jobs:
           echo "=================================================="
           echo "🔍 1. 检验 Pacman 包元数据规范性..."
           echo "=================================================="
-          PKG_FILE=$(ls dist/noctalia-git-*.pkg.tar.zst | grep -v 'latest' | head -n1)
+          PKG_FILE="dist/noctalia-git-latest-x86_64_v3.pkg.tar.zst"
           pacman -Qip "$PKG_FILE"
 
           echo "=================================================="
@@ -214,6 +213,38 @@ jobs:
           echo "=================================================="
           echo "🎉 5 重严格检验 100% 通过！"
           echo "=================================================="
+
+      # ═════════════════════════════════════════════════════════════════
+      # 🧹 清理 Release 历史废弃 Asset，防止无限堆积
+      # ═════════════════════════════════════════════════════════════════
+      - name: Prune Obsolete Release Assets
+        run: |
+          set -euo pipefail
+          echo "=== 正在清理 Release 'latest' 中的历史废弃 Asset ==="
+          RELEASE_DATA=$(curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/latest" 2>/dev/null || true)
+          
+          ASSETS=$(echo "$RELEASE_DATA" | jq -r '.assets[]? | "\(.id) \(.name)"')
+          
+          if [[ -n "$ASSETS" ]]; then
+            while IFS=" " read -r asset_id asset_name; do
+              [[ -z "$asset_id" ]] && continue
+              # 仅保留白名单（最新构建包与 checksum），其余历史旧版本包直接通过 GitHub API 清理
+              if [[ "$asset_name" != "noctalia-git-latest-x86_64_v3.pkg.tar.zst" && "$asset_name" != "sha256sums.txt" ]]; then
+                echo "🗑️ 正在删除历史废弃 asset: ${asset_name} (ID: ${asset_id})..."
+                curl -sSL -X DELETE \
+                  -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "https://api.github.com/repos/${{ github.repository }}/releases/assets/${asset_id}" || true
+              else
+                echo "✓ 保留当前有效 asset: ${asset_name} (ID: ${asset_id})"
+              fi
+            done <<< "$ASSETS"
+          fi
+          echo "=== 清理完成 ==="
 
       # ═════════════════════════════════════════════════════════════════
       # 🚀 零竞态发布与版本信号灯回写
