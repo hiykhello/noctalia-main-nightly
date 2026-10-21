@@ -1,6 +1,6 @@
 pkgbase = noctalia-bin-git
 	pkgdesc = A sleek, customizable desktop shell crafted for Wayland (Precompiled CachyOS v3 binary tracking git main)
-	pkgver = 5.3.0.r5883.g382314233
+	pkgver = 5.3.0.r5884.g86ab912ea
 	pkgrel = 1
 	epoch = 1
 	url = https://github.com/noctalia-dev/noctalia
