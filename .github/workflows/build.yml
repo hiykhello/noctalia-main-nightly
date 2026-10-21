@@ -1,4 +1,4 @@
-name: Nightly Build Noctalia Git
+name: Nightly Build Noctalia Git (v3)
 
 on:
   schedule:
@@ -40,7 +40,7 @@ jobs:
           
           # Check latest release in this repository
           LATEST_RELEASE=$(curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/nightly" 2>/dev/null || true)
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" 2>/dev/null || true)
           LAST_BUILT_SHA=$(echo "$LATEST_RELEASE" | jq -r '.body' | grep -Po '(?<=commit: `)[a-f0-9]{40}' || true)
           
           echo "Upstream SHA:    $UPSTREAM_SHA"
@@ -58,26 +58,29 @@ jobs:
           fi
 
   build:
-    name: Build Arch Package
+    name: Build CachyOS v3 Package
     needs: check
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     container:
-      image: archlinux:latest
+      # Official CachyOS v3 (AVX2/FMA/BMI2 optimized) container
+      image: cachyos/cachyos-v3:latest
 
     steps:
-      - name: Setup System & Base Tools
+      - name: Setup CachyOS v3 Environment & Tools
         run: |
           set -euo pipefail
-          # Configure official high-speed mirror & parallel downloads
+          # Configure high speed US CachyOS mirrors & parallel downloads
           sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
-          echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist
+          echo 'Server = https://us-mnz.soulharsh007.dev/cachyos/repo/$arch/$repo' > /etc/pacman.d/cachyos-mirrorlist
+          echo 'Server = https://us-mnz.soulharsh007.dev/cachyos/repo/$arch_v3/$repo' > /etc/pacman.d/cachyos-v3-mirrorlist
+          echo 'Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           
-          # Install git and sudo first for actions/checkout and builder user
+          # Ensure git, sudo, base-devel are installed
           pacman -Syu --noconfirm --needed git sudo base-devel
           
           # Setup non-root builder user
-          useradd -m -s /bin/bash builder
+          id -u builder &>/dev/null || useradd -m -s /bin/bash builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
       - name: Checkout repository
@@ -88,7 +91,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
-      - name: Install build dependencies & compiler tooling
+      - name: Install build dependencies (CachyOS v3 toolchain)
         run: |
           set -euo pipefail
           pacman -Syu --noconfirm --needed \
@@ -101,15 +104,14 @@ jobs:
             libqalculate libxml2 md4c tomlplusplus libical \
             nlohmann-json stb jemalloc jq
 
-          # Tune makepkg.conf: multi-threading, ccache, mold linker, fast zstd
+          # Tune makepkg for v3 multi-threading & fast zstd compression
           sed -i 's/^#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
           sed -i 's/^BUILDENV=(!distcc color !ccache check !sign)/BUILDENV=(!distcc color ccache check !sign)/' /etc/makepkg.conf
           sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
 
-      - name: Build package via makepkg
+      - name: Build package with makepkg
         run: |
           set -euo pipefail
-          # Build using aur-recipe/PKGBUILD checked out in repository
           su builder -c "cd aur-recipe && makepkg -s --noconfirm"
           
           mkdir -p dist
@@ -117,7 +119,7 @@ jobs:
           PKG_FILE=$(ls aur-recipe/noctalia-git-*.pkg.tar.zst | head -n1)
           cp "$PKG_FILE" dist/
           # Create latest alias
-          cp "$PKG_FILE" dist/noctalia-git-latest-x86_64.pkg.tar.zst
+          cp "$PKG_FILE" dist/noctalia-git-latest-x86_64_v3.pkg.tar.zst
           
           # Generate sha256 checksums
           cd dist
@@ -129,26 +131,31 @@ jobs:
         run: |
           set -euo pipefail
           PKG_FILE=$(ls dist/noctalia-git-*.pkg.tar.zst | grep -v 'latest' | head -n1)
-          VERSION=$(basename "$PKG_FILE" | sed 's/^noctalia-git-//;s/-x86_64.pkg.tar.zst$//')
+          VERSION=$(basename "$PKG_FILE" | sed -E 's/^noctalia-git-//;s/-(x86_64|x86_64_v3)\.pkg\.tar\.zst$//')
+          REAL_FILENAME=$(basename "$PKG_FILE")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Package Version: $VERSION"
+          echo "filename=$REAL_FILENAME" >> $GITHUB_OUTPUT
+          echo "Package Version:  $VERSION"
+          echo "Package Filename: $REAL_FILENAME"
 
-      - name: Release to GitHub Releases
+      - name: Publish Versioned Tag & Release (Atomic Zero-Race)
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: nightly
-          name: "Noctalia Git Nightly (${{ steps.meta.outputs.version }})"
+          tag_name: "v${{ steps.meta.outputs.version }}"
+          name: "Noctalia Git v3 Nightly (v${{ steps.meta.outputs.version }})"
+          make_latest: true
           body: |
-            Automated Nightly Build tracking `noctalia-dev/noctalia` main branch.
+            Automated Nightly Build with **CachyOS x86_64_v3** (AVX2/FMA/BMI2) optimizations.
             
             - **Package Version**: `${{ steps.meta.outputs.version }}`
+            - **Architecture**: `x86_64_v3` (Optimized for modern x86-64 CPUs)
             - **Upstream commit**: `${{ needs.check.outputs.upstream_sha }}`
             - **Commit Message**: `${{ needs.check.outputs.upstream_msg }}`
             
             ---
-            ### ⚡ 快速安装与更新 (Zero-Compile Instant Install)
+            ### ⚡ 单行极速安装 (Instant Install)
             ```bash
-            run0 pacman -U "https://github.com/${{ github.repository }}/releases/download/nightly/noctalia-git-latest-x86_64.pkg.tar.zst"
+            run0 pacman -U "https://github.com/${{ github.repository }}/releases/download/v${{ steps.meta.outputs.version }}/${{ steps.meta.outputs.filename }}"
             ```
           files: dist/*
         env:
