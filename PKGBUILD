@@ -2,7 +2,7 @@
 
 pkgname=noctalia-bin-git
 _pkgname=noctalia
-pkgver=5.3.0.r5881.g8daaa253a
+pkgver=5.3.0.r5883.g382314233
 pkgrel=1
 epoch=1
 pkgdesc='A sleek, customizable desktop shell crafted for Wayland (Precompiled CachyOS v3 binary tracking git main)'
