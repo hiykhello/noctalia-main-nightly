@@ -2,63 +2,137 @@ name: Nightly Build Noctalia Git
 
 on:
   schedule:
-    - cron: '0 20 * * *'  # 每天北京时间 04:00 自动检查构建
-  workflow_dispatch:      # 支持在 GitHub 网页一键手动触发
+    - cron: '0 20 * * *'  # 每天北京时间 04:00 (UTC 20:00) 自动检查构建
+  workflow_dispatch:      # 支持网页端随时手动一键触发
+    inputs:
+      force_build:
+        description: 'Force build even if no new upstream commit'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: noctalia-nightly-build
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
+  check:
+    name: Check Upstream Changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      upstream_msg: ${{ steps.check.outputs.upstream_msg }}
+    steps:
+      - name: Query upstream commit
+        id: check
+        run: |
+          set -euo pipefail
+          COMMIT_DATA=$(curl -sSL "https://api.github.com/repos/noctalia-dev/noctalia/commits/main")
+          UPSTREAM_SHA=$(echo "$COMMIT_DATA" | jq -r .sha)
+          UPSTREAM_MSG=$(echo "$COMMIT_DATA" | jq -r '.commit.message' | head -n1)
+          
+          # Check latest release in this repository
+          LATEST_RELEASE=$(curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/nightly" 2>/dev/null || true)
+          LAST_BUILT_SHA=$(echo "$LATEST_RELEASE" | jq -r '.body' | grep -Po '(?<=commit: `)[a-f0-9]{40}' || true)
+          
+          echo "Upstream SHA:    $UPSTREAM_SHA"
+          echo "Last Built SHA:  $LAST_BUILT_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "upstream_msg=$UPSTREAM_MSG" >> $GITHUB_OUTPUT
+          
+          FORCE="${{ inputs.force_build || false }}"
+          if [[ "$FORCE" == "true" ]] || [[ "$UPSTREAM_SHA" != "$LAST_BUILT_SHA" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Decision: BUILD NEEDED"
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "Decision: UP-TO-DATE, SKIPPING"
+          fi
+
   build:
     name: Build Arch Package
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     container:
-      image: archlinux:base-devel
+      image: archlinux:latest
+
     steps:
-      - name: Install dependencies
+      - name: Setup System & Build Environment
         run: |
+          set -euo pipefail
+          # Configure mirror and parallel downloads
+          sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
+          echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist
+          
+          # Upgrade base and install core build tools & ccache
           pacman -Syu --noconfirm --needed \
-            git meson ninja pkgconf wayland wayland-protocols \
+            base-devel git ccache mold clang \
+            meson ninja pkgconf wayland wayland-protocols \
             libglvnd freetype2 fontconfig noto-fonts \
             cairo pango harfbuzz libxkbcommon glib2 \
             libsecret libsodium sdbus-cpp libpipewire wireplumber polkit \
             pam curl libwebp libjxl libsndfile librsvg \
             libqalculate libxml2 md4c tomlplusplus libical \
-            nlohmann-json stb jemalloc clang sudo
+            nlohmann-json stb jemalloc sudo jq
+
+          # Create unprivileged build user with sudo access
+          useradd -m -s /bin/bash builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          
+          # Tune makepkg.conf: multi-threading, ccache, mold linker, fast zstd
+          sed -i 's/^#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
+          sed -i 's/^BUILDENV=(!distcc color !ccache check !sign)/BUILDENV=(!distcc color ccache check !sign)/' /etc/makepkg.conf
+          sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
 
       - name: Build noctalia-git via makepkg
         run: |
-          useradd -m builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          set -euo pipefail
           su builder -c "git clone https://aur.archlinux.org/noctalia-git.git /home/builder/noctalia-git"
           su builder -c "cd /home/builder/noctalia-git && makepkg -s --noconfirm"
-          mkdir -p /home/builder/dist
-          cp /home/builder/noctalia-git/noctalia-git-*.pkg.tar.zst /home/builder/dist/
-          # Create a fixed-name copy for static link downloading
-          cp /home/builder/noctalia-git/noctalia-git-*.pkg.tar.zst /home/builder/dist/noctalia-git-latest-x86_64.pkg.tar.zst
-          mv /home/builder/dist ./dist
+          
+          mkdir -p dist
+          # Copy real package
+          PKG_FILE=$(ls /home/builder/noctalia-git/noctalia-git-*.pkg.tar.zst | head -n1)
+          cp "$PKG_FILE" dist/
+          # Create latest alias
+          cp "$PKG_FILE" dist/noctalia-git-latest-x86_64.pkg.tar.zst
+          
+          # Generate sha256 checksums
+          cd dist
+          sha256sum noctalia-git-*.pkg.tar.zst > sha256sums.txt
+          cd ..
 
-      - name: Get version info
-        id: vars
+      - name: Extract package version metadata
+        id: meta
         run: |
-          pkg_file=$(ls dist/noctalia-git-*.pkg.tar.zst | grep -v 'latest' | head -n1)
-          version=$(basename "$pkg_file" | sed 's/^noctalia-git-//;s/-x86_64.pkg.tar.zst$//')
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "Built version: $version"
+          set -euo pipefail
+          PKG_FILE=$(ls dist/noctalia-git-*.pkg.tar.zst | grep -v 'latest' | head -n1)
+          VERSION=$(basename "$PKG_FILE" | sed 's/^noctalia-git-//;s/-x86_64.pkg.tar.zst$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Package Version: $VERSION"
 
       - name: Release to GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: nightly
-          name: "Noctalia Git Nightly (${{ steps.vars.outputs.version }})"
+          name: "Noctalia Git Nightly (${{ steps.meta.outputs.version }})"
           body: |
-            Automated Nightly Build from `noctalia-dev/noctalia` main branch.
-            - Package Version: `${{ steps.vars.outputs.version }}`
-            - Built at: `${{ github.event.head_commit.timestamp || github.workflow }}`
+            Automated Nightly Build tracking `noctalia-dev/noctalia` main branch.
             
-            ### Quick Install
+            - **Package Version**: `${{ steps.meta.outputs.version }}`
+            - **Upstream commit**: `${{ needs.check.outputs.upstream_sha }}`
+            - **Commit Message**: `${{ needs.check.outputs.upstream_msg }}`
+            
+            ---
+            ### ⚡ 快速安装与更新 (Zero-Compile Instant Install)
             ```bash
-            run0 pacman -U "https://github.com/shenbeng/noctalia-main-nightly/releases/download/nightly/noctalia-git-latest-x86_64.pkg.tar.zst"
+            run0 pacman -U "https://github.com/${{ github.repository }}/releases/download/nightly/noctalia-git-latest-x86_64.pkg.tar.zst"
             ```
           files: dist/*
         env:
