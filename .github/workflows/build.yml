@@ -30,16 +30,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Query upstream commit
+      - name: Query upstream commit (Authenticated)
         id: check
         run: |
           set -euo pipefail
-          COMMIT_DATA=$(curl -sSL "https://api.github.com/repos/noctalia-dev/noctalia/commits/main")
+          COMMIT_DATA=$(curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/noctalia-dev/noctalia/commits/main")
           UPSTREAM_SHA=$(echo "$COMMIT_DATA" | jq -r .sha)
           UPSTREAM_MSG=$(echo "$COMMIT_DATA" | jq -r '.commit.message' | head -n1)
           
-          # Read last built commit recorded in repository
-          LATEST_RELEASE=$(curl -sSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          # Check latest release in this repository
+          LATEST_RELEASE=$(curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/latest" 2>/dev/null || true)
           LAST_BUILT_SHA=$(echo "$LATEST_RELEASE" | jq -r '.body' | grep -Po '(?<=commit: `)[a-f0-9]{40}' || true)
           
@@ -67,7 +68,7 @@ jobs:
       image: cachyos/cachyos-v3:latest
 
     steps:
-      - name: Setup CachyOS v3 Environment & Tools
+      - name: Setup CachyOS v3 Mirrors & Base System
         run: |
           set -euo pipefail
           sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
@@ -75,39 +76,50 @@ jobs:
           echo 'Server = https://us-mnz.soulharsh007.dev/cachyos/repo/$arch_v3/$repo' > /etc/pacman.d/cachyos-v3-mirrorlist
           echo 'Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           
-          pacman -Syu --noconfirm --needed git sudo base-devel
+          pacman -Syu --noconfirm --needed git sudo base-devel ccache mold clang jq
           id -u builder &>/dev/null || useradd -m -s /bin/bash builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Fix workspace ownership for builder user
+      - name: Cache ccache directory across builds
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-noctalia-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-noctalia-${{ runner.os }}-
+
+      - name: Setup workspace & ccache permissions
         run: |
+          mkdir -p .ccache
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
-      - name: Install build dependencies (CachyOS v3 toolchain)
+      - name: Install package build dependencies
         run: |
           set -euo pipefail
           pacman -Syu --noconfirm --needed \
-            ccache mold clang \
             meson ninja pkgconf wayland wayland-protocols \
             libglvnd freetype2 fontconfig noto-fonts \
             cairo pango harfbuzz libxkbcommon glib2 \
             libsecret libsodium sdbus-cpp libpipewire wireplumber polkit \
             pam curl libwebp libjxl libsndfile librsvg \
             libqalculate libxml2 md4c tomlplusplus libical \
-            nlohmann-json stb jemalloc jq
+            nlohmann-json stb jemalloc
 
+          # Configure makepkg: multi-threading, ccache, mold linker, multi-threaded zstd
           sed -i 's/^#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
           sed -i 's/^BUILDENV=(!distcc color !ccache check !sign)/BUILDENV=(!distcc color ccache check !sign)/' /etc/makepkg.conf
           sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
 
-      - name: Build package with makepkg
+      - name: Build package with makepkg (CachyOS v3)
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           set -euo pipefail
-          su builder -c "cd aur-recipe && makepkg -s --noconfirm"
+          su builder -c "export CCACHE_DIR='$CCACHE_DIR'; cd aur-recipe && makepkg -s --noconfirm"
           
           mkdir -p dist
           PKG_FILE=$(ls aur-recipe/noctalia-git-*.pkg.tar.zst | head -n1)
@@ -124,13 +136,16 @@ jobs:
           set -euo pipefail
           PKG_FILE=$(ls dist/noctalia-git-*.pkg.tar.zst | grep -v 'latest' | head -n1)
           VERSION=$(basename "$PKG_FILE" | sed -E 's/^noctalia-git-//;s/-(x86_64|x86_64_v3)\.pkg\.tar\.zst$//')
+          REAL_FILENAME=$(basename "$PKG_FILE")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Package Version: $VERSION"
+          echo "filename=$REAL_FILENAME" >> $GITHUB_OUTPUT
+          echo "Package Version:  $VERSION"
+          echo "Package Filename: $REAL_FILENAME"
 
       # ═════════════════════════════════════════════════════════════════
-      # 🧪 核心校验流程：确保包必须通过所有严格检验才允许发布
+      # 🧪 5 重严格全量自检 (Any failure immediately aborts release)
       # ═════════════════════════════════════════════════════════════════
-      - name: Run Strict Package & Binary Verification
+      - name: Run Strict Package & Binary Verification Suite
         run: |
           set -euo pipefail
           echo "=================================================="
@@ -140,38 +155,38 @@ jobs:
           pacman -Qip "$PKG_FILE"
 
           echo "=================================================="
-          echo "🔍 2. 检验关键核心文件是否存在..."
+          echo "🔍 2. 检验核心可执行文件与资源完整性..."
           echo "=================================================="
           pacman -Qlp "$PKG_FILE" | grep -q '/usr/bin/noctalia$' || { echo "❌ 致命错误: /usr/bin/noctalia 缺失!"; exit 1; }
           pacman -Qlp "$PKG_FILE" | grep -q '/usr/share/applications/.*\.desktop$' || { echo "❌ 致命错误: desktop 入口文件缺失!"; exit 1; }
           pacman -Qlp "$PKG_FILE" | grep -q '/usr/share/noctalia/assets/' || { echo "❌ 致命错误: UI 核心资源文件缺失!"; exit 1; }
 
           echo "=================================================="
-          echo "🔍 3. 容器内实机测试安装 (pacman -U)..."
+          echo "🔍 3. 容器内模拟实机安装 (pacman -U)..."
           echo "=================================================="
           pacman -U --noconfirm "$PKG_FILE"
 
           echo "=================================================="
-          echo "🔍 4. 检验动态链接依赖 (检查有无缺失的 .so)..."
+          echo "🔍 4. 扫描动态链接库依赖 (检查有无 missing .so)..."
           echo "=================================================="
           ldd /usr/bin/noctalia
           if ldd /usr/bin/noctalia | grep -i "not found"; then
-            echo "❌ 致命错误: 发现未满足的动态库依赖 (not found)!"
+            echo "❌ 致命错误: 发现缺失的动态链接库 (not found)!"
             exit 1
           fi
 
           echo "=================================================="
-          echo "🔍 5. 运行期可执行文件启动测试..."
+          echo "🔍 5. 运行期冒烟自检测试 (--version / --help)..."
           echo "=================================================="
           /usr/bin/noctalia --version
           /usr/bin/noctalia --help > /dev/null
 
           echo "=================================================="
-          echo "🎉 全部严格检验项 100% 通过！"
+          echo "🎉 5 重严格检验 100% 通过！"
           echo "=================================================="
 
       # ═════════════════════════════════════════════════════════════════
-      # 🚀 发布资产与信号灯回写（检验通过后才执行）
+      # 🚀 零竞态发布与版本信号灯回写
       # ═════════════════════════════════════════════════════════════════
       - name: Publish Release (latest)
         uses: softprops/action-gh-release@v3
@@ -180,16 +195,16 @@ jobs:
           name: "Noctalia Git v3 (${{ steps.meta.outputs.version }})"
           make_latest: true
           body: |
-            Automated Nightly Build with **CachyOS x86_64_v3** optimizations.
+            Automated Nightly Build with **CachyOS x86_64_v3** (AVX2/FMA/BMI2) optimizations.
             
             - **Package Version**: `${{ steps.meta.outputs.version }}`
-            - **Architecture**: `x86_64_v3` (AVX2/FMA/BMI2)
+            - **Architecture**: `x86_64_v3` (AVX2/FMA/BMI2 optimized)
             - **Upstream commit**: `${{ needs.check.outputs.upstream_sha }}`
             - **Commit Message**: `${{ needs.check.outputs.upstream_msg }}`
-            - **Verification Status**: ✅ 100% Passed (ldd, metadata, execution)
+            - **Verification Status**: ✅ 100% Passed (Metadata, File Integrity, ldd, Runtime)
             
             ---
-            ### ⚡ 快速安装与更新 (Instant Install)
+            ### ⚡ 单行极速安装 (Instant Install)
             ```bash
             run0 pacman -U "https://github.com/${{ github.repository }}/releases/download/latest/noctalia-git-latest-x86_64_v3.pkg.tar.zst"
             ```
@@ -197,12 +212,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update VERSION file on main branch
+      - name: Update VERSION file on main branch (Signal Paru)
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           echo "${{ steps.meta.outputs.version }}" > VERSION
-          git add VERSION
-          git commit -m "chore(release): bump built version to ${{ steps.meta.outputs.version }} [skip ci]" || true
-          git push origin main
+          if ! git diff --quiet VERSION; then
+            git add VERSION
+            git commit -m "chore(release): bump built version to ${{ steps.meta.outputs.version }} [skip ci]"
+            git push origin main
+            echo "Version updated and pushed to main."
+          else
+            echo "VERSION already up to date, skipping commit."
+          fi

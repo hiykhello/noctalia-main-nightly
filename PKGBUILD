@@ -47,16 +47,26 @@ conflicts=('noctalia' 'noctalia-git' 'noctalia-bin')
 
 source=(
   "noctalia-main-nightly::git+https://github.com/shenbeng/noctalia-main-nightly.git#branch=main"
-  "noctalia-${pkgver}.pkg.tar.zst::https://github.com/shenbeng/noctalia-main-nightly/releases/download/latest/noctalia-git-latest-x86_64_v3.pkg.tar.zst"
 )
-sha256sums=('SKIP' 'SKIP')
+sha256sums=('SKIP')
 
 pkgver() {
   cd "${srcdir}/noctalia-main-nightly"
   cat VERSION
 }
 
+prepare() {
+  local target_pkg="noctalia-git-${pkgver}-x86_64_v3.pkg.tar.zst"
+  local url="https://github.com/shenbeng/noctalia-main-nightly/releases/download/latest/noctalia-git-latest-x86_64_v3.pkg.tar.zst"
+  
+  if [[ ! -f "${srcdir}/${target_pkg}" ]]; then
+    echo "==> 正在从 Release 下载已验证通过的 CachyOS v3 预编译包 (${pkgver})..."
+    curl -sSL -f -C - -o "${srcdir}/${target_pkg}" "${url}"
+  fi
+}
+
 package() {
-  bsdtar -xf "${srcdir}/noctalia-${pkgver}.pkg.tar.zst" -C "${pkgdir}"
+  local target_pkg="noctalia-git-${pkgver}-x86_64_v3.pkg.tar.zst"
+  bsdtar -xf "${srcdir}/${target_pkg}" -C "${pkgdir}"
   rm -f "${pkgdir}"/.{PKGINFO,BUILDINFO,MTREE}
 }
