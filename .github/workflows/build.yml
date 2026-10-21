@@ -27,6 +27,9 @@ jobs:
       upstream_sha: ${{ steps.check.outputs.upstream_sha }}
       upstream_msg: ${{ steps.check.outputs.upstream_msg }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Query upstream commit
         id: check
         run: |
@@ -63,42 +66,55 @@ jobs:
       image: archlinux:latest
 
     steps:
-      - name: Setup System & Build Environment
+      - name: Setup System & Base Tools
         run: |
           set -euo pipefail
-          # Configure mirror and parallel downloads
+          # Configure official high-speed mirror & parallel downloads
           sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
           echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           
-          # Upgrade base and install core build tools & ccache
+          # Install git and sudo first for actions/checkout and builder user
+          pacman -Syu --noconfirm --needed git sudo base-devel
+          
+          # Setup non-root builder user
+          useradd -m -s /bin/bash builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Fix workspace ownership for builder user
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Install build dependencies & compiler tooling
+        run: |
+          set -euo pipefail
           pacman -Syu --noconfirm --needed \
-            base-devel git ccache mold clang \
+            ccache mold clang \
             meson ninja pkgconf wayland wayland-protocols \
             libglvnd freetype2 fontconfig noto-fonts \
             cairo pango harfbuzz libxkbcommon glib2 \
             libsecret libsodium sdbus-cpp libpipewire wireplumber polkit \
             pam curl libwebp libjxl libsndfile librsvg \
             libqalculate libxml2 md4c tomlplusplus libical \
-            nlohmann-json stb jemalloc sudo jq
+            nlohmann-json stb jemalloc jq
 
-          # Create unprivileged build user with sudo access
-          useradd -m -s /bin/bash builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          
           # Tune makepkg.conf: multi-threading, ccache, mold linker, fast zstd
           sed -i 's/^#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
           sed -i 's/^BUILDENV=(!distcc color !ccache check !sign)/BUILDENV=(!distcc color ccache check !sign)/' /etc/makepkg.conf
           sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
 
-      - name: Build noctalia-git via makepkg
+      - name: Build package via makepkg
         run: |
           set -euo pipefail
-          su builder -c "git clone https://aur.archlinux.org/noctalia-git.git /home/builder/noctalia-git"
-          su builder -c "cd /home/builder/noctalia-git && makepkg -s --noconfirm"
+          # Build using aur-recipe/PKGBUILD checked out in repository
+          su builder -c "cd aur-recipe && makepkg -s --noconfirm"
           
           mkdir -p dist
           # Copy real package
-          PKG_FILE=$(ls /home/builder/noctalia-git/noctalia-git-*.pkg.tar.zst | head -n1)
+          PKG_FILE=$(ls aur-recipe/noctalia-git-*.pkg.tar.zst | head -n1)
           cp "$PKG_FILE" dist/
           # Create latest alias
           cp "$PKG_FILE" dist/noctalia-git-latest-x86_64.pkg.tar.zst
