@@ -1,0 +1,65 @@
+name: Nightly Build Noctalia Git
+
+on:
+  schedule:
+    - cron: '0 20 * * *'  # 每天北京时间 04:00 自动检查构建
+  workflow_dispatch:      # 支持在 GitHub 网页一键手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Arch Package
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git meson ninja pkgconf wayland wayland-protocols \
+            libglvnd freetype2 fontconfig noto-fonts \
+            cairo pango harfbuzz libxkbcommon glib2 \
+            libsecret libsodium sdbus-cpp libpipewire wireplumber polkit \
+            pam curl libwebp libjxl libsndfile librsvg \
+            libqalculate libxml2 md4c tomlplusplus libical \
+            nlohmann-json stb jemalloc clang sudo
+
+      - name: Build noctalia-git via makepkg
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          su builder -c "git clone https://aur.archlinux.org/noctalia-git.git /home/builder/noctalia-git"
+          su builder -c "cd /home/builder/noctalia-git && makepkg -s --noconfirm"
+          mkdir -p /home/builder/dist
+          cp /home/builder/noctalia-git/noctalia-git-*.pkg.tar.zst /home/builder/dist/
+          # Create a fixed-name copy for static link downloading
+          cp /home/builder/noctalia-git/noctalia-git-*.pkg.tar.zst /home/builder/dist/noctalia-git-latest-x86_64.pkg.tar.zst
+          mv /home/builder/dist ./dist
+
+      - name: Get version info
+        id: vars
+        run: |
+          pkg_file=$(ls dist/noctalia-git-*.pkg.tar.zst | grep -v 'latest' | head -n1)
+          version=$(basename "$pkg_file" | sed 's/^noctalia-git-//;s/-x86_64.pkg.tar.zst$//')
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Built version: $version"
+
+      - name: Release to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "Noctalia Git Nightly (${{ steps.vars.outputs.version }})"
+          body: |
+            Automated Nightly Build from `noctalia-dev/noctalia` main branch.
+            - Package Version: `${{ steps.vars.outputs.version }}`
+            - Built at: `${{ github.event.head_commit.timestamp || github.workflow }}`
+            
+            ### Quick Install
+            ```bash
+            run0 pacman -U "https://github.com/shenbeng/noctalia-main-nightly/releases/download/nightly/noctalia-git-latest-x86_64.pkg.tar.zst"
+            ```
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
