@@ -13,7 +13,7 @@ on:
 
 concurrency:
   group: noctalia-nightly-build
-  cancel-in-progress: true
+  cancel-in-progress: false # 排队等待而非强杀，防止状态截断
 
 permissions:
   contents: write
@@ -38,6 +38,11 @@ jobs:
             "https://api.github.com/repos/noctalia-dev/noctalia/commits/main")
           UPSTREAM_SHA=$(echo "$COMMIT_DATA" | jq -r .sha)
           UPSTREAM_MSG=$(echo "$COMMIT_DATA" | jq -r '.commit.message' | head -n1)
+
+          if [[ -z "$UPSTREAM_SHA" || "$UPSTREAM_SHA" == "null" ]]; then
+            echo "❌ 无法获取上游 commit SHA，API 响应异常: $COMMIT_DATA"
+            exit 1
+          fi
           
           # Check latest release in this repository
           LATEST_RELEASE=$(curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
@@ -68,17 +73,39 @@ jobs:
       image: cachyos/cachyos-v3:latest
 
     steps:
-      - name: Setup CachyOS v3 Mirrors & Base System
+      - name: Setup CachyOS Mirrors, Sandbox & Build Environment
         run: |
           set -euo pipefail
+          # 1. 优化 pacman 配置并关闭容器不支持的网络沙箱（消除 ldconfig 报错）
           sed -i 's/^#ParallelDownloads = 5/ParallelDownloads = 10/' /etc/pacman.conf
+          sed -i '/\[options\]/a DisableSandboxNetwork' /etc/pacman.conf
+
+          # 2. 配置全球最优 CachyOS v3 与 Arch 镜像源
           echo 'Server = https://us-mnz.soulharsh007.dev/cachyos/repo/$arch/$repo' > /etc/pacman.d/cachyos-mirrorlist
           echo 'Server = https://us-mnz.soulharsh007.dev/cachyos/repo/$arch_v3/$repo' > /etc/pacman.d/cachyos-v3-mirrorlist
           echo 'Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           
-          pacman -Syu --noconfirm --needed git sudo base-devel ccache mold clang jq
+          # 3. 单次全量安装工具链与所有编译依赖（避免重复刷新数据库）
+          pacman -Syu --noconfirm --needed \
+            git sudo base-devel ccache mold clang jq \
+            meson ninja pkgconf wayland wayland-protocols \
+            libglvnd freetype2 fontconfig noto-fonts \
+            cairo pango harfbuzz libxkbcommon glib2 \
+            libsecret libsodium sdbus-cpp libpipewire wireplumber polkit \
+            pam curl libwebp libjxl libsndfile librsvg \
+            libqalculate libxml2 md4c tomlplusplus libical \
+            nlohmann-json stb jemalloc
+
+          # 4. 创建非 root 构建用户
           id -u builder &>/dev/null || useradd -m -s /bin/bash builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+          # 5. 配置 makepkg: 多核加速、ccache、mold 极速链接器、x86_64_v3 架构与多线程 zstd
+          sed -i 's/^#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
+          sed -i 's/^BUILDENV=(!distcc color !ccache check !sign)/BUILDENV=(!distcc color ccache check !sign)/' /etc/makepkg.conf
+          sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
+          sed -i 's/^LDFLAGS="/LDFLAGS="-fuse-ld=mold /' /etc/makepkg.conf
+          sed -i 's/^CARCH="x86_64"/CARCH="x86_64_v3"/' /etc/makepkg.conf
 
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -97,29 +124,32 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
-      - name: Install package build dependencies
-        run: |
-          set -euo pipefail
-          pacman -Syu --noconfirm --needed \
-            meson ninja pkgconf wayland wayland-protocols \
-            libglvnd freetype2 fontconfig noto-fonts \
-            cairo pango harfbuzz libxkbcommon glib2 \
-            libsecret libsodium sdbus-cpp libpipewire wireplumber polkit \
-            pam curl libwebp libjxl libsndfile librsvg \
-            libqalculate libxml2 md4c tomlplusplus libical \
-            nlohmann-json stb jemalloc
-
-          # Configure makepkg: multi-threading, ccache, mold linker, multi-threaded zstd
-          sed -i 's/^#MAKEFLAGS="-j2"/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
-          sed -i 's/^BUILDENV=(!distcc color !ccache check !sign)/BUILDENV=(!distcc color ccache check !sign)/' /etc/makepkg.conf
-          sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
-
       - name: Build package with makepkg (CachyOS v3)
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_NOHASHDIR: "true"
+          CCACHE_SLOPPINESS: "include_file_mtime,time_macros"
         run: |
           set -euo pipefail
-          su builder -c "export CCACHE_DIR='$CCACHE_DIR'; cd aur-recipe && makepkg -s --noconfirm"
+          export CCACHE_DIR="$CCACHE_DIR"
+          export CCACHE_BASEDIR="$CCACHE_BASEDIR"
+          export CCACHE_NOHASHDIR="$CCACHE_NOHASHDIR"
+          export CCACHE_SLOPPINESS="$CCACHE_SLOPPINESS"
+          ccache -M 2G
+          echo "=== 构建前 ccache 统计 ==="
+          ccache -s
+
+          su builder -c "
+            export CCACHE_DIR='$CCACHE_DIR'
+            export CCACHE_BASEDIR='$CCACHE_BASEDIR'
+            export CCACHE_NOHASHDIR='$CCACHE_NOHASHDIR'
+            export CCACHE_SLOPPINESS='$CCACHE_SLOPPINESS'
+            cd aur-recipe && makepkg -s --noconfirm
+          "
+
+          echo "=== 构建后 ccache 统计 ==="
+          ccache -s
           
           mkdir -p dist
           PKG_FILE=$(ls aur-recipe/noctalia-git-*.pkg.tar.zst | head -n1)
@@ -204,7 +234,9 @@ jobs:
             - **Verification Status**: ✅ 100% Passed (Metadata, File Integrity, ldd, Runtime)
             
             ---
-            ### ⚡ 单行极速安装 (Instant Install)
+            ### 📦 本地更新说明
+            - 本地使用 `noctalia-bin-git`，直接运行常规 **`paru`** 命令即可自动识别最新构建并免编译极速更新。
+            - 亦支持单行热装测试：
             ```bash
             run0 pacman -U "https://github.com/${{ github.repository }}/releases/download/latest/noctalia-git-latest-x86_64_v3.pkg.tar.zst"
             ```

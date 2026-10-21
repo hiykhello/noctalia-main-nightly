@@ -52,7 +52,7 @@ sha256sums=('SKIP')
 
 pkgver() {
   cd "${srcdir}/noctalia-main-nightly"
-  cat VERSION
+  sed -E 's/^[0-9]+://;s/-[0-9]+$//' VERSION
 }
 
 prepare() {
