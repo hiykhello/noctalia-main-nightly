@@ -106,6 +106,9 @@ jobs:
           sed -i 's/COMPRESSZST=(zstd -c -z -q -)/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
           sed -i 's/^LDFLAGS="/LDFLAGS="-fuse-ld=mold /' /etc/makepkg.conf
           sed -i 's/^CARCH="x86_64"/CARCH="x86_64_v3"/' /etc/makepkg.conf
+          # 严格锁定基准架构为 x86-64-v3，防止云端 Runner 宿主机泄露 AVX-512 (-march=native)
+          sed -i -E 's/-march=[a-zA-Z0-9_-]+/-march=x86-64-v3 -mtune=generic/g' /etc/makepkg.conf /etc/makepkg.conf.d/* 2>/dev/null || true
+          sed -i 's/target-cpu=native/target-cpu=x86-64-v3/g' /etc/makepkg.conf /etc/makepkg.conf.d/* 2>/dev/null || true
 
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -114,9 +117,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .ccache
-          key: ccache-noctalia-${{ runner.os }}-${{ github.sha }}
+          key: ccache-noctalia-v3-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
-            ccache-noctalia-${{ runner.os }}-
+            ccache-noctalia-v3-${{ runner.os }}-
 
       - name: Setup workspace & ccache permissions
         run: |
@@ -211,7 +214,16 @@ jobs:
           /usr/bin/noctalia --help > /dev/null
 
           echo "=================================================="
-          echo "🎉 5 重严格检验 100% 通过！"
+          echo "🔍 6. 验证指令集纯净度 (确保严格限定在 v3，不得包含 AVX-512 / zmm)..."
+          echo "=================================================="
+          if objdump -d /usr/bin/noctalia | grep -qE "%zmm"; then
+            echo "❌ 致命错误: 检测到 AVX-512 (zmm) 指令，违背 x86_64_v3 架构兼容性规范!"
+            exit 1
+          fi
+          echo "✓ 架构纯净度校验通过：无 AVX-512 指令泄露。"
+
+          echo "=================================================="
+          echo "🎉 6 重严格检验 100% 通过！"
           echo "=================================================="
 
       # ═════════════════════════════════════════════════════════════════

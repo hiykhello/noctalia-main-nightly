@@ -64,6 +64,8 @@ pkgver() {
 }
 
 build() {
+  CFLAGS="${CFLAGS//-march=native/-march=x86-64-v3}"
+  CXXFLAGS="${CXXFLAGS//-march=native/-march=x86-64-v3}"
   CXXFLAGS+=" -Wno-unused-result"
   arch-meson "${_pkgname}" build-release \
     -Db_ndebug=true \
